@@ -1,7 +1,5 @@
 import java.net.*;
-import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.List;
 import java.io.*;
 
 class Controller {
@@ -11,7 +9,13 @@ class Controller {
     private HashMap<String, Double> fileSizes = new HashMap<>();
     private HashMap<String, DStore> fileDStores = new HashMap<>();
 
-    
+    /**
+     * Status of the index.
+     */
+    public enum Status {
+        STORE_IN_PROGRESS, STORE_COMPLETED, REMOVE_IN_PROGRESS, REMOVE_COMPLETED
+    }
+
     public static void main(String[] args) {
         try {
             new Controller(Integer.parseInt(args[0]), Integer.parseInt(args[1]),
@@ -30,7 +34,7 @@ class Controller {
         try (ServerSocket ss = new ServerSocket(cport)) {
             for (;;) {
                 try (Socket client = ss.accept()) {
-                    acceptClient(ss, client);
+                    acceptConnection(ss, client);
                 }
             }
         } catch (IOException e) {
@@ -43,11 +47,9 @@ class Controller {
      * @param ss        server socket used to listen on.
      * @param client    client's socket.
      */
-    private  void acceptClient(ServerSocket ss, Socket client) {
-        try (
-            BufferedReader in = new BufferedReader(
-                new InputStreamReader(client.getInputStream()))
-        ) {
+    private  void acceptConnection(ServerSocket ss, Socket client) {
+        try {
+            BufferedReader in = new BufferedReader(new InputStreamReader(client.getInputStream()));
             String line;
             while ((line = in.readLine()) != null) {
                 System.out.println(line + "received");
@@ -55,11 +57,12 @@ class Controller {
 
                 switch (words[0].toUpperCase()) {
                     case "JOIN":
-                        join(words[1], client);
+                        join(Integer.parseInt(words[1]), client);
                     case "STORE":
                         store(words[1], client);
                 }
             }
+            in.close();
         } catch (IOException e) {
             e.printStackTrace();
         }
@@ -73,15 +76,18 @@ class Controller {
      * @param dStoreSocket
      */
     private void join(Integer port, Socket dStoreSocket) {
-        if (dStores.containsKey(dStoreSocket)) {
+        // If dStore has not already joined add.
+        if (!dStores.containsKey(dStoreSocket)) {
             dStores.put(dStoreSocket, port);
         }
 
+        PrintWriter out = NEW
         try (
-            BufferedWriter out = new BufferedWriter(
+            PrintWriter out = new PrintWriter(
                 new OutputStreamWriter(dStoreSocket.getOutputStream()))
         ) {
-            out.write("Successfully joined");
+            System.out.println("DStore joined");
+            out.println(StatusMessages.JOINED_SUCCESS);
         } catch (IOException e) {
             e.printStackTrace();
         }
@@ -98,6 +104,6 @@ class Controller {
     }
 
     public void getDStoreList() {
-        new 
+        
     }
 }
