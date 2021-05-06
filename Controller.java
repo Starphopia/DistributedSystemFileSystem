@@ -1,26 +1,37 @@
 import java.net.*;
-import java.util.HashMap;
+import java.util.*;
 import java.io.*;
+
 
 class Controller {
     private int R;
     private double timeout, rebalancePeriod;
-    private HashMap<Socket, Integer> dStores = new HashMap<Socket, Integer>();
-    private HashMap<String, Double> fileSizes = new HashMap<>();
-    private HashMap<String, DStore> fileDStores = new HashMap<>();
+    private HashMap<Integer, DStoreRecord> dStores = new HashMap<>();
+    private HashMap<String, Integer> fileSizes = new HashMap<>();
+    private HashMap<String, List<Integer>> fileLocations = new HashMap<>();
+
+    private volatile Status indexStatus = Status.READY;
+    private final String joinedMsg = "Joined success";
+    private HashMap<String, List<Integer>> storeAckList = new HashMap<String, List<Integer>>();
+
+    private ControllerLogger logger;
+    private ErrorLogger errorLogger;
 
     /**
      * Status of the index.
      */
     public enum Status {
-        STORE_IN_PROGRESS, STORE_COMPLETED, REMOVE_IN_PROGRESS, REMOVE_COMPLETED
+        READY, STORE_IN_PROGRESS, STORE_COMPLETED, REMOVE_IN_PROGRESS, REMOVE_COMPLETED
     }
 
     public static void main(String[] args) {
         try {
+            ControllerLogger.init(Logger.LoggingType.ON_FILE_AND_TERMINAL);
             new Controller(Integer.parseInt(args[0]), Integer.parseInt(args[1]),
-                           Double.parseDouble(args[2]), Double.parseDouble(args[3]));
+                    Double.parseDouble(args[2]), Double.parseDouble(args[3]));
         } catch (NumberFormatException e) {
+            e.printStackTrace();
+        } catch (IOException e) {
             e.printStackTrace();
         }
     }
@@ -28,82 +39,82 @@ class Controller {
     public Controller(int cport, int R, double timeout, double rebalancePeriod) {
         this.R = R;
         this.timeout = timeout;
-        this.rebalancePeriod = rebalancePeriod;    
-        
+        this.rebalancePeriod = rebalancePeriod;
+        errorLogger = new ErrorLogger("controllerError.log");
+
         // Creates a new socket for listening to.
         try (ServerSocket ss = new ServerSocket(cport)) {
             for (;;) {
-                try (Socket client = ss.accept()) {
-                    acceptConnection(ss, client);
-                }
+                Socket client = ss.accept();
+                new Thread(new ConnectionThread(ss, client, this)).start();
             }
         } catch (IOException e) {
-            e.printStackTrace();
+            errorLogger.logError(e.getMessage());
         }
+    }
+
+    public void printDStores() {
+        System.out.println("The Dstores store files: ");
+        dStores.entrySet().stream().forEach(System.out::println);
+        System.out.println("The file sizes are: ");
+        fileSizes.entrySet().stream().forEach(System.out::println);
+    }
+
+    public int getR() {
+        return R;
+    }
+
+    public double getTimeout() {
+        return timeout;
+    }
+
+    public HashMap<Integer, DStoreRecord> getDStores() {
+        return dStores;
     }
 
     /**
-     * Proccesses messages of one client.
-     * @param ss        server socket used to listen on.
-     * @param client    client's socket.
+     * Checks whether a file exists within the file system.
+     * @param filename      name of the file queried.
+     * @return true if it exists
      */
-    private  void acceptConnection(ServerSocket ss, Socket client) {
-        try {
-            BufferedReader in = new BufferedReader(new InputStreamReader(client.getInputStream()));
-            String line;
-            while ((line = in.readLine()) != null) {
-                System.out.println(line + "received");
-                String[] words = line.split(" ");
+    public boolean fileExists(String filename) {
+        return fileSizes.containsKey(filename);
+    }
 
-                switch (words[0].toUpperCase()) {
-                    case "JOIN":
-                        join(Integer.parseInt(words[1]), client);
-                    case "STORE":
-                        store(words[1], client);
-                }
-            }
-            in.close();
-        } catch (IOException e) {
-            e.printStackTrace();
-        }
+    public ErrorLogger getErrorLogger() {
+        return errorLogger;
     }
 
 
+    public void setIndexStatus(Status status) {
+        indexStatus = status;
+    }
+
+    public void addStoreAckExpectation(String fileName) {
+        storeAckList.put(fileName, new ArrayList<>());
+    }
+
+    public void recordStoreAck(String fileName, Integer port) {
+        storeAckList.get(fileName).add(port);
+    }
+
+    public List<Integer> getAckReceieved(String fileName) { return storeAckList.get(fileName); }
+
+    public void removeStoreAckExpectation(String fileName) {
+        storeAckList.remove(fileName);
+    }
+
+    public void newFile(String filename, int size, List<Integer> ports) {
+        fileSizes.put(filename, size);
+        fileLocations.put(filename, ports);
+    }
 
     /**
-     * Adds a dstore to the possible dstores.
-     * @param port
-     * @param dStoreSocket
+     * Returns a list of the files stored in the system.
+     * @return
      */
-    private void join(Integer port, Socket dStoreSocket) {
-        // If dStore has not already joined add.
-        if (!dStores.containsKey(dStoreSocket)) {
-            dStores.put(dStoreSocket, port);
-        }
-
-        PrintWriter out = NEW
-        try (
-            PrintWriter out = new PrintWriter(
-                new OutputStreamWriter(dStoreSocket.getOutputStream()))
-        ) {
-            System.out.println("DStore joined");
-            out.println(StatusMessages.JOINED_SUCCESS);
-        } catch (IOException e) {
-            e.printStackTrace();
-        }
-    }
-
-
-    /**
-     * Returns the ports that the files can be stored on to the client.
-     * @param fileName
-     * @param client
-     */
-    private void store(String fileName, Socket client) {
-
-    }
-
-    public void getDStoreList() {
-        
+    public Set<String> getFiles() {
+        return fileSizes.keySet();
     }
 }
+
