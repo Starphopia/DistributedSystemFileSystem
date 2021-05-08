@@ -4,18 +4,17 @@ import java.io.*;
 
 
 class Controller {
-    private int R;
-    private double timeout, rebalancePeriod;
-    private HashMap<Integer, DStoreRecord> dStores = new HashMap<>();
-    private HashMap<String, Integer> fileSizes = new HashMap<>();
-    private HashMap<String, List<Integer>> fileLocations = new HashMap<>();
+    private final int R;
+    private final double timeout;
+    private final double rebalancePeriod;
+    private volatile HashMap<Integer, Socket> dStores = new HashMap<>();
+    private volatile HashMap<String, Integer> fileSizes = new HashMap<>();
+    private volatile HashMap<String, List<Integer>> fileLocations = new HashMap<>();
 
     private volatile Status indexStatus = Status.READY;
-    private final String joinedMsg = "Joined success";
-    private HashMap<String, List<Integer>> storeAckList = new HashMap<String, List<Integer>>();
-
-    private ControllerLogger logger;
-    private ErrorLogger errorLogger;
+    private HashMap<String, List<Integer>> storeAckList = new HashMap<>();
+    private final Object ackListLock = new Object();
+    private final ErrorLogger errorLogger;
 
     /**
      * Status of the index.
@@ -29,9 +28,7 @@ class Controller {
             ControllerLogger.init(Logger.LoggingType.ON_FILE_AND_TERMINAL);
             new Controller(Integer.parseInt(args[0]), Integer.parseInt(args[1]),
                     Double.parseDouble(args[2]), Double.parseDouble(args[3]));
-        } catch (NumberFormatException e) {
-            e.printStackTrace();
-        } catch (IOException e) {
+        } catch (NumberFormatException | IOException e) {
             e.printStackTrace();
         }
     }
@@ -53,13 +50,6 @@ class Controller {
         }
     }
 
-    public void printDStores() {
-        System.out.println("The Dstores store files: ");
-        dStores.entrySet().stream().forEach(System.out::println);
-        System.out.println("The file sizes are: ");
-        fileSizes.entrySet().stream().forEach(System.out::println);
-    }
-
     public int getR() {
         return R;
     }
@@ -68,7 +58,7 @@ class Controller {
         return timeout;
     }
 
-    public HashMap<Integer, DStoreRecord> getDStores() {
+    public HashMap<Integer, Socket> getDStores() {
         return dStores;
     }
 
@@ -81,27 +71,47 @@ class Controller {
         return fileSizes.containsKey(filename);
     }
 
+    public int getFileSize(String filename) { return fileSizes.get(filename); }
+
+    /**
+     * @param filename      name of file to be found in the system.
+     * @return the ports of D stores that stores this file.
+     */
+    public List<Integer> getDStoresWithFile(String filename) { return fileLocations.get(filename); }
+
     public ErrorLogger getErrorLogger() {
         return errorLogger;
     }
 
 
-    public void setIndexStatus(Status status) {
+    public synchronized void setIndexStatus(Status status) {
         indexStatus = status;
     }
 
+    public synchronized boolean isReady() { return indexStatus.equals(Status.READY);};
+
     public void addStoreAckExpectation(String fileName) {
-        storeAckList.put(fileName, new ArrayList<>());
+        synchronized(ackListLock) {
+            storeAckList.put(fileName, new ArrayList<>());
+        }
     }
 
     public void recordStoreAck(String fileName, Integer port) {
-        storeAckList.get(fileName).add(port);
+        synchronized(ackListLock) {
+            storeAckList.get(fileName).add(port);
+        }
     }
 
-    public List<Integer> getAckReceieved(String fileName) { return storeAckList.get(fileName); }
+    public List<Integer> getAckReceived(String fileName) {
+        synchronized(ackListLock) {
+            return storeAckList.get(fileName);
+        }
+    }
 
     public void removeStoreAckExpectation(String fileName) {
-        storeAckList.remove(fileName);
+        synchronized (ackListLock) {
+            storeAckList.remove(fileName);
+        }
     }
 
     public void newFile(String filename, int size, List<Integer> ports) {
@@ -109,9 +119,10 @@ class Controller {
         fileLocations.put(filename, ports);
     }
 
+
     /**
      * Returns a list of the files stored in the system.
-     * @return
+     * @return the files.
      */
     public Set<String> getFiles() {
         return fileSizes.keySet();

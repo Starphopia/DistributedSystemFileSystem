@@ -2,14 +2,15 @@ import java.io.*;
 import java.net.*;
 
 public class DStore {
-    private Integer port, cport;
-    private int timeout;
-    private String fileFolder;
+    private final Integer port;
+    private final Integer cport;
+    private final int timeout;
+    private final String fileFolder;
     private BufferedReader fromControl;
     private Socket conSocket;
     private PrintWriter toControl;
 
-    private ErrorLogger errorLogger = new ErrorLogger("dstoreError.log");
+    private final ErrorLogger errorLogger = new ErrorLogger("dstoreError.log");
 
     public static void main(String[] args) {
         try {
@@ -40,7 +41,7 @@ public class DStore {
 
             // Attempts to join the system.
             joinSystem(conSocket);
-            listen(listenSocket, conSocket);
+            listen(listenSocket);
 
             listenSocket.close();
             conSocket.close();
@@ -49,7 +50,7 @@ public class DStore {
         }
     }
 
-    private void listen(ServerSocket listenSocket, Socket conSocket) {
+    private void listen(ServerSocket listenSocket) {
         for (;;) {
             try {
                 Socket client = listenSocket.accept();
@@ -59,8 +60,9 @@ public class DStore {
                 String[] words = message.split(" ");
                 DstoreLogger.getInstance().messageReceived(client, message);
                 switch (words[0]) {
-                    case Protocol.STORE_TOKEN:
-                        store(words[1], Integer.parseInt(words[2]), client);
+                    case Protocol.STORE_TOKEN -> store(words[1], Integer.parseInt(words[2]), client);
+                    case Protocol.LOAD_DATA_TOKEN -> load(words[1], client);
+                    default -> errorLogger.logError(Protocol.MALFORMED_ERROR);
                 }
 
             } catch (IOException e) {
@@ -72,7 +74,6 @@ public class DStore {
     /**
      * Continuously sends request to join a system. Creates the buffered reader and print writer as well.
      * @param conSocket     socket that will be used to connect to the server.
-     * @return The socket to the system used to successfully joined.
      */
     private void joinSystem(Socket conSocket) {
         try {
@@ -85,9 +86,7 @@ public class DStore {
 //            conSocket.setSoTimeout(timeout);
             String line;
             while ((line = fromControl.readLine()) == null || !line.equals(Protocol.JOINED_COMPLETE_TOKEN));
-            if (line.equals(Protocol.JOINED_COMPLETE_TOKEN)) {
-                DstoreLogger.getInstance().messageReceived(conSocket, line);
-            }
+            DstoreLogger.getInstance().messageReceived(conSocket, line);
         } catch (SocketTimeoutException e) {
             System.out.println("Resending join request");
         } catch (IOException e) {
@@ -113,16 +112,17 @@ public class DStore {
             toClient.flush();
             DstoreLogger.getInstance().messageSent(client, Protocol.ACK_TOKEN);
 
-            // Receivesdata from the client.
+            // Receives data from the client.
             InputStream inputStream = client.getInputStream();
             client.setSoTimeout(timeout);
             byte[] data = inputStream.readNBytes(fileSize);
 
             // Writes received data to the user.
             fileStream.write(data);
+            fileStream.flush();
 
             // Send back the acknowledgment.
-            toControl.println(Protocol.STORE_ACK_TOKEN);
+            toControl.println(Protocol.STORE_ACK_TOKEN + " " + filename);
             toControl.flush();
             DstoreLogger.getInstance().messageSent(conSocket, Protocol.STORE_ACK_TOKEN);
         } catch(SocketTimeoutException e) {
@@ -136,6 +136,28 @@ public class DStore {
             if (fileStream != null) {
                 fileStream.close();
             }
+        }
+    }
+
+
+    /**
+     * Returns the data requested by the client.
+     * @param filename
+     * @param client
+     * @throws IOException
+     */
+    private void load(String filename, Socket client) throws IOException {
+        File file = new File(fileFolder + File.separator + filename);
+
+        if (!file.exists()) {
+            client.close();
+        } else {
+            InputStream fileStream = new FileInputStream(file);
+            byte[] data = fileStream.readAllBytes();
+
+            OutputStream outputStream = client.getOutputStream();
+            outputStream.write(data);
+            outputStream.flush();
         }
     }
 }
