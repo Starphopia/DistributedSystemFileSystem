@@ -41,6 +41,9 @@ public class DStore {
 
             // Attempts to join the system.
             joinSystem(conSocket);
+            // Starts the thread that listens to the controller.
+            new Thread(new DStoreListenToControlThread()).start();
+            // Starts listening to the client.
             listen(listenSocket);
 
             listenSocket.close();
@@ -76,21 +79,31 @@ public class DStore {
      * @param conSocket     socket that will be used to connect to the server.
      */
     private void joinSystem(Socket conSocket) {
-        try {
-            toControl = Helper.makeWriter(conSocket);
-            fromControl = Helper.makeReader(conSocket);
-            toControl.println(Protocol.JOIN_TOKEN + " " + port);
-            toControl.flush();
+        boolean hasJoined = false;
+        while (!hasJoined) {
+            try {
+                toControl = Helper.makeWriter(conSocket);
+                fromControl = Helper.makeReader(conSocket);
+                toControl.println(Protocol.JOIN_TOKEN + " " + port);
+                toControl.flush();
 
-            // Waits for acknowledgment
-//            conSocket.setSoTimeout(timeout);
-            String line;
-            while ((line = fromControl.readLine()) == null || !line.equals(Protocol.JOINED_COMPLETE_TOKEN));
-            DstoreLogger.getInstance().messageReceived(conSocket, line);
-        } catch (SocketTimeoutException e) {
-            System.out.println("Resending join request");
-        } catch (IOException e) {
-            e.printStackTrace();
+                // Waits for acknowledgment
+                conSocket.setSoTimeout(timeout);
+                String line;
+                while ((line = fromControl.readLine()) == null || !line.equals(Protocol.JOINED_COMPLETE_TOKEN)) ;
+                DstoreLogger.getInstance().messageReceived(conSocket, line);
+                conSocket.setSoTimeout(0);
+                hasJoined = true;
+            } catch (SocketTimeoutException e) {
+                errorLogger.logError("Resending join request");
+                try {
+                    Thread.sleep(100);
+                } catch (InterruptedException interruptedException) {
+                    interruptedException.printStackTrace();
+                }
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
         }
     }
 
@@ -122,9 +135,10 @@ public class DStore {
             fileStream.flush();
 
             // Send back the acknowledgment.
-            toControl.println(Protocol.STORE_ACK_TOKEN + " " + filename);
+            String msg = Protocol.STORE_ACK_TOKEN + " " + filename;
+            toControl.println(msg);
             toControl.flush();
-            DstoreLogger.getInstance().messageSent(conSocket, Protocol.STORE_ACK_TOKEN);
+            DstoreLogger.getInstance().messageSent(conSocket, msg);
         } catch(SocketTimeoutException e) {
             errorLogger.logError("Timeout!");
         } catch (SocketException e) {
@@ -149,6 +163,7 @@ public class DStore {
     private void load(String filename, Socket client) throws IOException {
         File file = new File(fileFolder + File.separator + filename);
 
+        // Serves up file if it exists else closes the connection.
         if (!file.exists()) {
             client.close();
         } else {
@@ -158,6 +173,49 @@ public class DStore {
             OutputStream outputStream = client.getOutputStream();
             outputStream.write(data);
             outputStream.flush();
+        }
+    }
+
+    private class DStoreListenToControlThread implements Runnable {
+
+        @Override
+        public void run() {
+            String line;
+            for (;;) {
+                try {
+                    line = fromControl.readLine();
+                    DstoreLogger.getInstance().messageReceived(conSocket, line);
+
+                    String[] words = line.split(" ");
+                    if (words[0].equalsIgnoreCase(Protocol.REMOVE_TOKEN)) {
+                        remove(words[1]);
+                    } else {
+                        errorLogger.logError("Malfunctioned message: " + line);
+                    }
+                } catch (IOException e) {
+                    errorLogger.logError(e.getMessage());
+                }
+            }
+        }
+
+        /**
+         * Removes a file from the index and returns the acknowledgement.
+         * @param filename          name of the file to be removed.
+         */
+        private void remove(String filename) {
+            File file = new File(fileFolder + File.separator + filename);
+
+            // Serves up file if it exists else closes the connection.
+            if (!file.exists()) {
+                toControl.println(Protocol.ERROR_FILE_DOES_NOT_EXIST_TOKEN);
+                DstoreLogger.getInstance().messageSent(conSocket, Protocol.ERROR_FILE_DOES_NOT_EXIST_TOKEN);
+            } else {
+                String msg = Protocol.REMOVE_ACK_TOKEN + " " + filename;
+                file.delete();
+                toControl.println(msg);
+                DstoreLogger.getInstance().messageSent(conSocket, msg);
+            }
+            toControl.flush();
         }
     }
 }

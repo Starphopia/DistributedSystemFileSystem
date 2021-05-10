@@ -2,20 +2,18 @@ import java.io.*;
 import java.sql.Timestamp;
 
 public class ErrorLogger {
-    private BufferedWriter writer;
+    private PrintWriter writer;
     public ErrorLogger(String path) {
         try {
-            writer = new BufferedWriter(new OutputStreamWriter(new FileOutputStream(path)));
+            writer = new PrintWriter(new OutputStreamWriter(new FileOutputStream(path)));
         } catch (FileNotFoundException e) {
             e.printStackTrace();
         }
     }
 
     public void logError(String msg) {
-        try {
-            writer.write(new Timestamp(System.currentTimeMillis()) + " " + msg);
-        } catch (IOException e) {
-            e.printStackTrace();
-        }
+        writer.println(new Timestamp(System.currentTimeMillis()) + " " + msg);
+        writer.flush();
+        System.out.println(msg);
     }
 }

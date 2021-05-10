@@ -42,8 +42,10 @@ class ConnectionThread implements Runnable {
                         case Protocol.LIST_TOKEN -> list(client);
                         case Protocol.STORE_TOKEN -> store(words[1], Integer.parseInt(words[2]), client);
                         case Protocol.STORE_ACK_TOKEN -> con.recordStoreAck(words[1], port);
+                        case Protocol.REMOVE_ACK_TOKEN -> con.recordRemoveAck(words[1], port);
                         case Protocol.LOAD_TOKEN -> load(words[1], client);
                         case Protocol.RELOAD_TOKEN -> reload(words[1], client);
+                        case Protocol.REMOVE_TOKEN -> remove(words[1], client);
                         default -> con.getErrorLogger().logError(Protocol.MALFORMED_ERROR + " " + line);
                     }
                 } else {
@@ -58,8 +60,6 @@ class ConnectionThread implements Runnable {
             con.getErrorLogger().logError(e.getMessage());
         } catch (IndexOutOfBoundsException e) {
             con.getErrorLogger().logError(Protocol.MALFORMED_ERROR + " " + line);
-        } catch (DStoreAlreadyExistsException e) {
-            con.getErrorLogger().logError("DStore " + port + " already exists");
         }
     }
 
@@ -69,27 +69,23 @@ class ConnectionThread implements Runnable {
      * @param port              of the dstore
      * @param dStoreSocket      used to communicate with the dstore
      */
-    private void join(Integer port, Socket dStoreSocket) throws DStoreAlreadyExistsException {
-        HashMap<Integer, Socket> dStores = con.getDStores();
-        boolean isNew = !dStores.containsKey(port) || !dStores.get(port).equals(dStoreSocket);
+    private void join(Integer port, Socket dStoreSocket) {
         this.port = port;
         // If dStore has not already joined add and logs it.
         try {
-            if (isNew) {
+            if (!con.hasJoined(port, dStoreSocket)) {
                 ControllerLogger.getInstance().dstoreJoined(dStoreSocket, port);
-                dStores.put(port, dStoreSocket);
+                con.addDStore(port, dStoreSocket);
+            } else {
+                con.getErrorLogger().logError("DStore " + port + " already exists");
             }
 
-            PrintWriter out = Helper.makeWriter(dStores.get(port));
+            PrintWriter out = Helper.makeWriter(dStoreSocket);
             out.println(Protocol.JOINED_COMPLETE_TOKEN);
             ControllerLogger.getInstance().messageSent(dStoreSocket, Protocol.JOINED_COMPLETE_TOKEN);
             out.flush();
         } catch (IOException e) {
-            e.printStackTrace();
-        }
-
-        if (!isNew) {
-            throw new DStoreAlreadyExistsException("DStore already exists");
+            con.getErrorLogger().logError(e.getMessage());
         }
     }
 
@@ -107,15 +103,14 @@ class ConnectionThread implements Runnable {
             toClient.flush();
             ControllerLogger.getInstance().messageSent(client, Protocol.ERROR_FILE_ALREADY_EXISTS_TOKEN);
         } else {
-            synchronized (this) {
-                while (!con.isReady());
+            synchronized (con.getModifyIndexLock()) {
                 con.setIndexStatus(Controller.Status.STORE_IN_PROGRESS);
 
                 // Gets R random DStores.
                 List<Integer> selectedStores = new ArrayList<>(con.getDStores().keySet());
                 Collections.shuffle(selectedStores);
                 selectedStores = selectedStores.subList(0, con.getR());
-                con.addStoreAckExpectation(filename);
+                con.addStoreAckExpectation(filename, selectedStores);
 
                 String selectedString = Protocol.STORE_TO_TOKEN + " " + selectedStores.stream()
                         .map(Object::toString)
@@ -128,9 +123,8 @@ class ConnectionThread implements Runnable {
                 try {
                     // Waits for all of the acknowledgments to be received.
                     long conTimeout = (long)con.getTimeout();
-                    ArrayList<Integer> finalSelectedStores = new ArrayList<>(selectedStores);
                     CompletableFuture.supplyAsync(() -> {
-                        while (!con.getAckReceived(filename).equals(finalSelectedStores)) ;
+                        while (!con.hasAllStoreAcksReceived(filename)) ;
                         return true;
                     }).get(conTimeout, TimeUnit.MILLISECONDS);
 
@@ -138,13 +132,12 @@ class ConnectionThread implements Runnable {
                     con.newFile(filename, size, selectedStores);
                     toClient.println(Protocol.STORE_COMPLETE_TOKEN);
                     con.setIndexStatus(Controller.Status.STORE_COMPLETED);
-                    con.removeStoreAckExpectation(filename);
                     toClient.flush();
                     ControllerLogger.getInstance().messageSent(client, Protocol.STORE_COMPLETE_TOKEN);
-                } catch (TimeoutException e) {
-                    System.out.println("Time out has occurred");
-                } catch (InterruptedException | ExecutionException e) {
-                    e.printStackTrace();
+                } catch (TimeoutException | InterruptedException | ExecutionException e) {
+                    con.getErrorLogger().logError(e.getMessage());
+                } finally {
+                    con.deleteStoreAckExpectation(filename);
                 }
                 con.setIndexStatus(Controller.Status.READY);
             }
@@ -156,36 +149,90 @@ class ConnectionThread implements Runnable {
      * @param filename      name of the file requested.
      * @param client        used to communicate with the client.
      */
-    public void load(String filename, Socket client) {
+    private void load(String filename, Socket client) {
         try {
             PrintWriter writer = Helper.makeWriter(client);
             if (!con.fileExists(filename)) {
                 writer.println(Protocol.ERROR_FILE_DOES_NOT_EXIST_TOKEN);
-            } else if (!loadRequest.isNewFile(filename)){
+                ControllerLogger.getInstance().messageSent(client, Protocol.ERROR_FILE_DOES_NOT_EXIST_TOKEN);
+                writer.flush();
+            } else if (loadRequest.isNewFile(filename)){
                 List<Integer> availableStores = con.getDStoresWithFile(filename);
                 // Randomises order in which client will try out D stores.
                 Collections.shuffle(availableStores);
                 loadRequest.newRequest(filename, new PriorityQueue<>(availableStores));
-                writer.println(Protocol.LOAD_FROM_TOKEN + " "
-                               + loadRequest.nextDStore() + " "
-                               + con.getFileSize(filename));
+                String msg = Protocol.LOAD_FROM_TOKEN + " " + loadRequest.nextDStore() + " "
+                             + con.getFileSize(filename);
+                writer.println(msg);
+                ControllerLogger.getInstance().messageSent(client, msg);
+                writer.flush();
             }
-            writer.flush();
         } catch (IOException e) {
-            e.printStackTrace();
+            con.getErrorLogger().logError(e.getMessage());
         }
     }
 
-    public void reload(String filename, Socket client) {
+    private void reload(String filename, Socket client) {
         try {
             PrintWriter toClient = Helper.makeWriter(client);
-            if (loadRequest.isEmptyDStores()) {
-                toClient.println(Protocol.ERROR_LOAD_TOKEN);
-            } else {
-                toClient.println(Protocol.LOAD_FROM_TOKEN + " " + con.getFileSize(filename));
-            }
+            String msg = loadRequest.isEmptyDStores() ? Protocol.ERROR_FILE_ALREADY_EXISTS_TOKEN
+                                                      : Protocol.LOAD_FROM_TOKEN + " " + con.getFileSize(filename);
+            toClient.println(msg);
+            ControllerLogger.getInstance().messageSent(client, msg);
             toClient.flush();
         } catch (IOException e) {
+            con.getErrorLogger().logError(e.getMessage());
+        }
+    }
+
+    /**
+     * Removes a selected file from the D store.
+     * @param filename      to be removed
+     * @param client        used to communicate with the client whom the removal is for.
+     */
+    private void remove(String filename, Socket client) {
+        try {
+            PrintWriter toClient = Helper.makeWriter(client);
+
+            // If the file does not exist in the index notify the user, else proceed.
+            if (!con.fileExists(filename)) {
+                toClient.println(Protocol.ERROR_FILE_DOES_NOT_EXIST_TOKEN);
+                ControllerLogger.getInstance().messageSent(client, Protocol.ERROR_FILE_DOES_NOT_EXIST_TOKEN);
+            } else {
+                synchronized(con.getModifyIndexLock()) {
+                    con.setIndexStatus(Controller.Status.REMOVE_IN_PROGRESS);
+
+                    long conTimeout = (long)con.getTimeout();
+                    List<Integer> storesToUpdate = con.getDStoresWithFile(filename);
+                    List<Socket> storesSockets = new ArrayList<>(con.getDStoreSockets(storesToUpdate));
+
+                    // To keep records of acknowledgments.
+                    con.addRemoveAckExpectation(filename, storesToUpdate);
+                    // For filename
+                    for (Socket sock : storesSockets) {
+                        PrintWriter writer = Helper.makeWriter(sock);
+                        String msg = Protocol.REMOVE_TOKEN + " " + filename;
+                        writer.println(msg);
+                        ControllerLogger.getInstance().messageSent(sock, msg);
+                        writer.flush();
+                    }
+
+                    CompletableFuture.supplyAsync(() -> {
+                        while (con.hasAllRemoveAcksReceived(filename));
+                        return true;
+                    }).get(conTimeout, TimeUnit.MILLISECONDS);
+
+                    con.removeFile(filename);
+                    con.deleteRemoveAckExpectation(filename);
+                    toClient.println(Protocol.REMOVE_COMPLETE_TOKEN);
+                    toClient.flush();
+                    ControllerLogger.getInstance().messageSent(client, Protocol.REMOVE_COMPLETE_TOKEN);
+                    con.setIndexStatus(Controller.Status.REMOVE_COMPLETED);
+                    con.setIndexStatus(Controller.Status.READY);
+                }
+            }
+            toClient.flush();
+        } catch (IOException | ExecutionException | InterruptedException | TimeoutException e) {
             con.getErrorLogger().logError(e.getMessage());
         }
     }
@@ -204,20 +251,14 @@ class ConnectionThread implements Runnable {
             writer.flush();
             ControllerLogger.getInstance().messageSent(client, files);
         } catch (IOException e) {
-            e.printStackTrace();
-        }
-    }
-
-    private static class DStoreAlreadyExistsException extends Exception {
-        public DStoreAlreadyExistsException(String errorMessage) {
-            super(errorMessage);
+            con.getErrorLogger().logError(e.getMessage());
         }
     }
 
     /**
      * Keeps track of the D stores left to try.
      */
-    private class LoadRequest {
+    private static class LoadRequest {
         private String filename = "";
         private PriorityQueue<Integer> dStoresLeft = new PriorityQueue<>();
 
@@ -238,7 +279,7 @@ class ConnectionThread implements Runnable {
         }
 
         /**
-         * @param filename
+         * @param filename      the name of the file to be checked against the current file.
          * @return true if the filename is the same as the current one being requested.
          */
         public boolean isNewFile(String filename) {
