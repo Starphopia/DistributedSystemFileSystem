@@ -270,22 +270,29 @@ class Controller {
         Map<Integer, List<String>> okFreeStores = filterByNumFiles(dStoreFilesMap, n -> n >= minFiles && n < maxFiles);
 
         try {
-            rebalanceLostFiles(pendingSends, underflowStores, okFreeStores, minFiles);
+            rebalanceLostFiles(pendingSends, underflowStores, okFreeStores, minFiles, maxFiles);
+            rebalanceOverFlowStores(pendingSends, pendingRemoves, underflowStores, overflowStores, okFreeStores,
+                                    maxFiles, minFiles);
         } catch (NoPossibleReceiverException e) {
             errorLogger.logError("No possible receiver exception has occured! ");
             errorLogger.logError(e.getStackTrace().toString());
         }
     }
 
+    /**
+     * @param pendingSends          requests for D stores to send.
+     * @param underFlowStores       stores that have less files than the minimum requirement.
+     * @param okFreeStores          stores that have an acceptable number of files that aren't at max capacity.
+     * @param minFiles              the minimum number of files that a D store must contain.
+     * @throws NoPossibleReceiverException  if there are no possible stores that can store this.
+     */
     private void rebalanceLostFiles(HashMap<Integer, ArrayList<SendRequest>> pendingSends,
                                     Map<Integer, List<String>> underFlowStores,
-                                    Map<Integer, List<String>> okFreeStores, int minFiles)
+                                    Map<Integer, List<String>> okFreeStores, int minFiles, int maxFiles)
                                     throws NoPossibleReceiverException{
         // Assign files that doesn't have enough replicas to D stores with free space.
         for (Map.Entry<String, Integer> fileInfo : getNotEnoughReplicaFiles().entrySet()) {
             ListIterator<Integer> senders = fileLocations.get(fileInfo.getKey()).listIterator();
-            ListIterator<Integer> underFlowReceivers = getPortsWithoutFile(underFlowStores, fileInfo.getKey());
-            ListIterator<Integer> okFreeReceivers = getPortsWithoutFile(okFreeStores, fileInfo.getKey());
 
             // Assigns file to receiver D store.
             for (int i = 0; i < fileInfo.getValue(); i++) {
@@ -294,42 +301,69 @@ class Controller {
                     senders = fileLocations.get(fileInfo.getKey()).listIterator();
                 }
                 int sender = senders.next();
-
-                int receiver = 0;
-                if (underFlowReceivers.hasNext()) {
-                    receiver = underFlowReceivers.next();
-                    int newSize = underFlowStores.get(receiver).size() + 1;
-                    // Checks whether d stores are no longer underflow.
-                    if (newSize < minFiles) {
-                        underFlowStores.get(receiver).add(fileInfo.getKey());
-                    } else {
-                        underFlowStores.remove(receiver);
-                    }
-                    if (newSize < R) {
-                        okFreeStores.put(receiver, underFlowStores.get(receiver));
-                    }
-                } else if (okFreeReceivers.hasNext()){
-                    receiver = okFreeReceivers.next();
-                    int newSize = okFreeStores.get(receiver).size() + 1;
-                    // Checks whether d store is at maximum capacity.
-                    if (newSize == R) {
-                        okFreeStores.remove(receiver);
-                    }
-                } else {
-                    throw new NoPossibleReceiverException("No possible receiver exception for " + fileInfo.getKey());
-                }
+                int receiver = getReceiver(minFiles, maxFiles, underFlowStores, okFreeStores, fileInfo.getKey());
 
                 fileLocations.get(fileInfo.getKey()).add(receiver);
 
                 // Then adds a send request.
-                if (pendingSends.containsKey(sender)) {
+                if (!pendingSends.containsKey(sender)) {
                     pendingSends.put(sender, new ArrayList<>());
                 }
                 pendingSends.get(sender).add(new SendRequest(fileInfo.getKey(), receiver));
-
             }
         }
     }
+
+
+    /**
+     * Assigns overflowing D store files to the rest.
+     * @param pendingSends          send requests.
+     * @param pendingRemoves        remove requests.
+     * @param underFlowStores       stores that holds less than the minimum number of files.
+     * @param overFlowStores        stores that holds more than the maximum number of files.
+     * @param okFreeStores          stores that hold an acceptable number of files that aren't at max capacity.
+     * @param maxFiles              that a store can hold.
+     * @param minFiles              that a store can hold.
+     */
+    private void rebalanceOverFlowStores(HashMap<Integer, ArrayList<SendRequest>> pendingSends,
+                                         HashMap<Integer, ArrayList<String>> pendingRemoves,
+                                         Map<Integer, List<String>> underFlowStores,
+                                         Map<Integer, List<String>> overFlowStores,
+                                         Map<Integer, List<String>> okFreeStores,
+                                         int maxFiles, int minFiles) {
+        // For each over flow D store, move as many files as possible.
+        for (Map.Entry<Integer, List<String>> store : overFlowStores.entrySet()) {
+            int dStoreSize = store.getValue().size();
+            ListIterator<String> files = store.getValue().listIterator();
+            String file;
+            while (dStoreSize > maxFiles) {
+                file = files.next();
+                int receiver = 0;
+                try {
+                    receiver = getReceiver(minFiles, maxFiles, underFlowStores, okFreeStores, file);
+                    fileLocations.get(file).add(receiver);
+
+                    // Then adds the send and remove requests.
+                    if (!pendingSends.containsKey(store.getKey())) {
+                        pendingSends.put(store.getKey(), new ArrayList<>());
+                    }
+                    pendingSends.get(store.getKey()).add(new SendRequest(file, receiver));
+
+                    if (!pendingRemoves.containsKey(store.getKey())) {
+                        pendingRemoves.put(store.getKey(), new ArrayList<>());
+                    }
+                    pendingRemoves.get(store.getKey()).add(file);
+
+                    dStoreSize--;
+                } catch (NoPossibleReceiverException e) {
+                    errorLogger.logError("No receivers available to store " + file);
+                    errorLogger.logError(e.getStackTrace().toString());
+                }
+            }
+        }
+    }
+
+
 
 
     /**
@@ -369,6 +403,47 @@ class Controller {
                 .collect(Collectors.toMap(Map.Entry::getKey, e -> R - e.getValue().size())));
     }
 
+
+    /**
+     * Returns the port of a store that can store a given file.
+     * @param minFiles              that a store can hold
+     * @param maxFiles              that a store can hold
+     * @param underFlowStores       holds less than the minimum number of files.
+     * @param okFreeStores          holds an acceptable number of files but can accept more.
+     * @param filename              name of the file to be stored.
+     * @return if a dstore can be found that can do the following.
+     * @throws NoPossibleReceiverException  if no dstores available that can store the file.
+     */
+    private int getReceiver(int minFiles, int maxFiles, Map<Integer, List<String>> underFlowStores,
+                            Map<Integer, List<String>> okFreeStores, String filename) throws NoPossibleReceiverException{
+        ListIterator<Integer> underFlowReceivers = getPortsWithoutFile(underFlowStores, filename);
+        ListIterator<Integer> okFreeReceivers = getPortsWithoutFile(okFreeStores, filename);
+
+        int receiver = 0;
+        // Checks if there are underflow D stores left to store the file.
+        if (underFlowReceivers.hasNext()) {
+            receiver = underFlowReceivers.next();
+            int newSize = underFlowStores.get(receiver).size() + 1;
+            // Checks whether d stores are no longer underflow.
+            if (newSize < minFiles) {
+                underFlowStores.get(receiver).add(filename);
+            } else {
+                okFreeStores.put(receiver, underFlowStores.get(receiver));
+                underFlowStores.remove(receiver);
+            }
+        } else if (okFreeReceivers.hasNext()){
+            receiver = okFreeReceivers.next();
+            int newSize = okFreeStores.get(receiver).size() + 1;
+            // Checks whether d store is at maximum capacity.
+            if (newSize == maxFiles) {
+                okFreeStores.remove(receiver);
+            }
+        } else {
+            throw new NoPossibleReceiverException("No possible receiver exception for " + filename);
+        }
+
+        return receiver;
+    }
 
     /**
      * Scheduled task that will periodically rebalance.
