@@ -1,9 +1,10 @@
 import java.io.*;
 import java.net.*;
+import java.util.Arrays;
+import java.util.stream.Collectors;
 
 public class DStore {
     private final Integer port;
-    private final Integer cport;
     private final int timeout;
     private final String fileFolder;
     private BufferedReader fromControl;
@@ -32,7 +33,6 @@ public class DStore {
         this.fileFolder = fileFolder;
         new File(fileFolder).mkdirs();
         this.port = port;
-        this.cport = cport;
 
         try {
             DstoreLogger.init(Logger.LoggingType.ON_FILE_AND_TERMINAL, port);
@@ -133,6 +133,7 @@ public class DStore {
             // Writes received data to the user.
             fileStream.write(data);
             fileStream.flush();
+            fileStream.close();
 
             // Send back the acknowledgment.
             String msg = Protocol.STORE_ACK_TOKEN + " " + filename;
@@ -141,7 +142,7 @@ public class DStore {
             DstoreLogger.getInstance().messageSent(conSocket, msg);
         } catch(SocketTimeoutException e) {
             errorLogger.logError("Timeout!");
-        } catch (SocketException e) {
+        } catch(SocketException e) {
             errorLogger.logError(e.getMessage());
         } catch (IOException e) {
             e.printStackTrace();
@@ -156,9 +157,9 @@ public class DStore {
 
     /**
      * Returns the data requested by the client.
-     * @param filename
-     * @param client
-     * @throws IOException
+     * @param filename          name of the file to be retrieved
+     * @param client            the socket used to communciate with teh client
+     * @throws IOException if a problem occurs.
      */
     private void load(String filename, Socket client) throws IOException {
         File file = new File(fileFolder + File.separator + filename);
@@ -169,6 +170,7 @@ public class DStore {
         } else {
             InputStream fileStream = new FileInputStream(file);
             byte[] data = fileStream.readAllBytes();
+            fileStream.close();
 
             OutputStream outputStream = client.getOutputStream();
             outputStream.write(data);
@@ -187,10 +189,10 @@ public class DStore {
                     DstoreLogger.getInstance().messageReceived(conSocket, line);
 
                     String[] words = line.split(" ");
-                    if (words[0].equalsIgnoreCase(Protocol.REMOVE_TOKEN)) {
-                        remove(words[1]);
-                    } else {
-                        errorLogger.logError("Malfunctioned message: " + line);
+                    switch (words[0].toUpperCase()) {
+                        case Protocol.REMOVE_TOKEN -> remove(words[1]);
+                        case Protocol.LIST_TOKEN -> list();
+                        default -> errorLogger.logError("Malfunctioned message: " + line);
                     }
                 } catch (IOException e) {
                     errorLogger.logError(e.getMessage());
@@ -216,6 +218,21 @@ public class DStore {
                 DstoreLogger.getInstance().messageSent(conSocket, msg);
             }
             toControl.flush();
+        }
+
+        /**
+         * Sends a list of files stored in the directory to the controller.
+         */
+        private void list() {
+            File directory = new File(fileFolder);
+            String msg = Arrays.stream(directory.listFiles())
+                               .filter(File::isFile)
+                               .map(File::getName)
+                               .collect(Collectors.joining(" "));
+            msg = Protocol.LIST_TOKEN + " " + msg;
+            toControl.println(msg);
+            toControl.flush();
+            DstoreLogger.getInstance().log(msg);
         }
     }
 }

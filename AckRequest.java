@@ -9,7 +9,7 @@ public class AckRequest {
     private Set<Integer> receivedAcks;
     private final Set<Integer> expectedPorts;
     private volatile boolean isFulfilled;
-    private Object lock = new Object();
+    private final Object lock = new Object();
 
     public AckRequest(List<Integer> expectedPorts) {
         this.expectedPorts = new HashSet<>(expectedPorts);
