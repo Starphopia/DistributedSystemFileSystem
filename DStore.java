@@ -1,6 +1,6 @@
 import java.io.*;
 import java.net.*;
-import java.util.Arrays;
+import java.util.*;
 import java.util.stream.Collectors;
 
 public class DStore {
@@ -11,7 +11,10 @@ public class DStore {
     private Socket conSocket;
     private PrintWriter toControl;
 
+    private boolean rebalanceSuccessful = true;
+
     private final ErrorLogger errorLogger = new ErrorLogger("dstoreError.log");
+
 
     public static void main(String[] args) {
         try {
@@ -39,8 +42,6 @@ public class DStore {
             ServerSocket listenSocket = new ServerSocket(port);
             conSocket = new Socket(InetAddress.getLocalHost(), cport);
 
-            // Attempts to join the system.
-            joinSystem(conSocket);
             // Starts the thread that listens to the controller.
             new Thread(new DStoreListenToControlThread()).start();
             // Starts listening to the client.
@@ -84,7 +85,9 @@ public class DStore {
             try {
                 toControl = Helper.makeWriter(conSocket);
                 fromControl = Helper.makeReader(conSocket);
-                toControl.println(Protocol.JOIN_TOKEN + " " + port);
+                String msg = Protocol.JOIN_TOKEN + " " + port;
+                toControl.println(msg);
+                DstoreLogger.getInstance().messageSent(conSocket, msg);
                 toControl.flush();
 
                 // Waits for acknowledgment
@@ -182,19 +185,23 @@ public class DStore {
 
         @Override
         public void run() {
+            // Attempts to join the system.
+            joinSystem(conSocket);
+
             String line;
             for (;;) {
                 try {
-                    line = fromControl.readLine();
+                    while ((line = fromControl.readLine()) == null);
                     DstoreLogger.getInstance().messageReceived(conSocket, line);
 
                     String[] words = line.split(" ");
                     switch (words[0].toUpperCase()) {
                         case Protocol.REMOVE_TOKEN -> remove(words[1]);
                         case Protocol.LIST_TOKEN -> list();
+                        case Protocol.REBALANCE_TOKEN -> rebalance(words);
                         default -> errorLogger.logError("Malfunctioned message: " + line);
                     }
-                } catch (IOException e) {
+                } catch (IOException | NullPointerException e) {
                     errorLogger.logError(e.getMessage());
                 }
             }
@@ -232,7 +239,103 @@ public class DStore {
             msg = Protocol.LIST_TOKEN + " " + msg;
             toControl.println(msg);
             toControl.flush();
-            DstoreLogger.getInstance().log(msg);
+            DstoreLogger.getInstance().messageSent(conSocket, msg);
+        }
+
+
+        /**
+         * According to the messages removes and sends the requested files.
+         * @param words
+         */
+        private void rebalance(String[] words) {
+            rebalanceSuccessful = true;
+            try {
+                // Ignores the REBALANCE token.
+                PriorityQueue<String> argumentQ = Arrays.stream(words)
+                        .skip(1).collect(Collectors.toCollection(PriorityQueue::new));
+
+                // First gets the number of files to send.
+                for (int n = 0; n < Integer.parseInt(argumentQ.poll()); n++) {
+                    File file = new File(fileFolder+ File.separator + argumentQ.poll());
+
+                    // Sends the file to each port.
+                    for (int p = 0; p < Integer.parseInt(argumentQ.poll()); p++) {
+                        new Thread(new SendFileToDStoreThread(file, Integer.parseInt(argumentQ.poll()))).run();
+                    }
+                }
+
+                // Finally deletes all the files.
+                argumentQ.stream()
+                         .map(file -> new File(fileFolder + File.separator + file))
+                         .forEach(File::delete);
+
+            } catch (Exception e) {
+                errorLogger.logError(e.getMessage());
+                rebalanceSuccessful = false;
+            }
+
+            if (rebalanceSuccessful) {
+                toControl.println(Protocol.REBALANCE_COMPLETE_TOKEN);
+                toControl.flush();
+            }
+        }
+
+        public boolean isInteger(String argument) {
+            try {
+                Integer.parseInt(argument);
+                return true;
+            } catch(NumberFormatException e) {
+
+            }
+            return false;
         }
     }
+
+
+    private class SendFileToDStoreThread implements Runnable {
+        private File fileToSend;
+        private int dStoreReceiverPort;
+
+        public SendFileToDStoreThread(File fileToSend, int dStoreReceiverPort) {
+            this.fileToSend = fileToSend;
+        }
+
+        // Sends a file to the D store.
+        @Override
+        public void run() {
+            try (
+                Socket receiverSock = new Socket(InetAddress.getLocalHost(), dStoreReceiverPort);
+                OutputStream toReceiverStream = receiverSock.getOutputStream();
+                FileInputStream fileStream = new FileInputStream(fileToSend);
+                PrintWriter toReceiver = new PrintWriter(new OutputStreamWriter(receiverSock.getOutputStream()));
+                BufferedReader fromReceiver = new BufferedReader(new InputStreamReader(receiverSock.getInputStream()))
+            ) {
+                // Sends the message to the receiver
+                String msg = Protocol.REBALANCE_STORE_TOKEN + " " + fileFolder + " " + fileToSend.length();
+                DstoreLogger.getInstance().messageSent(receiverSock, msg);
+                toReceiver.println(msg);
+                toReceiver.flush();
+
+                // Gets the ACK
+                receiverSock.setSoTimeout(timeout);
+                String line;
+                while (!(line = fromReceiver.readLine()).equals(Protocol.ACK_TOKEN));
+
+                // Transfers file to the host.
+                toReceiverStream.write(fileStream.readAllBytes());
+                toReceiverStream.flush();
+            } catch (UnknownHostException e) {
+                errorLogger.logError(e.getMessage());
+                e.printStackTrace();
+                rebalanceSuccessful = false;
+            } catch (IOException e) {
+                errorLogger.logError(e.getMessage());
+                e.printStackTrace();
+                rebalanceSuccessful = false;
+            }
+        }
+    }
+
+
+
 }
